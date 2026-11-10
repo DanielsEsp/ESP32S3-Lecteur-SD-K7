@@ -1,1 +1,2346 @@
 
+// ESP32-S3 : radio TuneIn + horloge + enregistrement SD + lecteur de fichiers
+// Dossier du sketch : radio_tunein/  ->  radio_tunein.ino, tunein.h, types.h
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <sys/time.h>
+#include <TFT_eSPI.h>
+#include "U8g2_for_TFT_eSPI.h"
+#include <TJpg_Decoder.h>
+#include <Audio.h>
+#include <atomic>
+
+#define USE_PNG 1                         // 1 = logos PNG gérés (bibliothèque PNGdec)
+#if USE_PNG
+  #include <PNGdec.h>
+#endif
+
+#include "types.h"                        // Mode, ImgSlot, Scroller, RecEntry
+
+// =====================  À ADAPTER  =====================
+const char* WIFI_SSID = "SSID";
+const char* WIFI_PASS = "PASS";
+
+// I2S -> MAX98357A
+#define I2S_BCLK 5
+#define I2S_LRC  6
+#define I2S_DOUT 4
+
+// Tactile FT6336U (I2C 0x38)
+#define TP_ADDR 0x38
+#define TP_SDA  8
+#define TP_SCL  9
+#define TP_RST  16
+
+// Carte SD (bus SPI séparé de l'écran)
+#define SD_CS   38
+#define SD_MOSI 40
+#define SD_SCK  41
+#define SD_MISO 42
+//#define SD_FREQ 10000000
+#define SD_FREQ 4000000
+
+// Panneau natif (portrait)
+#define PANEL_W 320
+#define PANEL_H 480
+
+// Enregistrement AUTO : si le serveur n'envoie pas les titres dans le flux,
+// on coupe ce délai (ms) après le changement de titre détecté.
+#define REC_TAIL_MS 8000
+
+// Nom des fichiers enregistrés : 1 = "Artiste - Titre.mp3", 0 = "Titre.mp3"
+#define REC_NAME_WITH_ARTIST 1
+
+// Lecteur d'enregistrements : 1 = clic sur la barre de progression pour se déplacer.
+// Si le compilateur proteste sur setFilePos(), mets 0.
+#define USE_SEEK 0
+
+// Horloge
+const char* TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";   // Europe/Paris
+const bool  SMOOTH_SECONDS = true;        // true = aiguille fluide
+const uint16_t FRAME_MS = 40;             // ~25 images/s max
+// ======================================================
+
+#define SCR_W 480                         // paysage (rotation 1)
+#define SCR_H 320
+
+TFT_eSPI tft = TFT_eSPI();
+U8g2_for_TFT_eSPI u8f;
+Audio audio;
+Preferences prefs;
+
+enum Page { PAGE_CLOCK, PAGE_LIST, PAGE_PLAYER, PAGE_FILE };
+volatile Page page = PAGE_CLOCK;
+
+Mode mode = M_GENRE;                      // modes utilisés : M_GENRE, M_FAV, M_REC
+
+// ---- Genres et stations d'un genre (PSRAM) ----
+// Entrées au format "cle|Nom" (genre : "id=c57941|Pop" ; station : "s24861|Nom")
+const int    MAX_GENRES   = 800;
+const size_t GENBUF_SIZE  = 64 * 1024;
+char*     genBuf   = nullptr;
+uint32_t* genOff   = nullptr;
+int       genreCount = 0;
+
+const int    MAX_GS      = 1500;
+const size_t GSBUF_SIZE  = 128 * 1024;
+char*     gsBuf   = nullptr;
+uint32_t* gsOff   = nullptr;
+int       gsCount = 0;
+
+bool genreStationsView = false;           // mode GEN : false = liste des genres, true = stations
+int  genreCur = -1;
+
+// ---- Favoris (mémoire permanente) : entrées "id|Nom" ----
+const int MAX_FAV = 40;
+char favs[MAX_FAV][96];
+int  favCount = 0;
+int  confirmAct = 0;     // 0 = aucune, 1 = suppr. favori, 2 = vider favoris, 3 = suppr. enregistrement
+int  confirmIdx = -1;    // élément concerné (cas 1 et 3)
+
+// ---- Enregistrements sur la carte SD (mode SD) : liste en PSRAM ----
+const int MAX_REC = 400;
+RecEntry* recList = nullptr;
+int       recCount = 0;
+
+// Appui long en modes FAV / SD
+bool     favPress = false;
+uint32_t favT0 = 0;
+int      favIdx = -1;                     // >= 0 : ligne ; -2 : bouton central (mode FAV)
+
+int topIdx = 0;
+int volume = 6;                           // 0..21
+
+String curStation = "";
+String curArtist  = "";
+String curTitle   = "";
+
+// Message temporaire dans la ligne d'état de la liste
+char     toastMsg[48] = "";
+uint32_t toastUntil = 0;
+
+// ---- Mise en page : liste ----
+const int HEADER_H = 36;
+const int LIST_Y   = 38;
+const int ROW_H    = 34;
+const int ROWS     = 6;
+const int BTN_Y    = 268;
+const int BTN_H    = 48;
+const int BTN_W    = 60;                  // 8 boutons de 60 px
+
+// ---- Mise en page : lecteur (5 boutons de 88 px) ----
+const int PB_Y = 272, PB_H = 42, PB_W = 88;
+const int PB_VM_X = 6;      // V-
+const int PB_ST_X = 100;    // favori (radio) / précédent (fichier)
+const int PB_RC_X = 194;    // REC (radio) / lecture-pause (fichier)
+const int PB_AU_X = 288;    // AUTO (radio) / suivant (fichier)
+const int PB_VP_X = 382;    // V+
+
+// Barre de progression (lecteur de fichiers)
+const int FP_BAR_X = 20, FP_BAR_W = 440, FP_BAR_Y = 212, FP_BAR_H = 12;
+
+// Logo de la station (à gauche, devant le nom)
+const int LOGO_X = 6, LOGO_Y = 40, LOGO_S = 80;
+const int STATION_TEXT_X = 96;
+
+// ---- Communication entre tâches (le dessin se fait uniquement dans loop()) ----
+volatile bool newStream   = false;
+volatile bool stopStream  = false;
+volatile bool volDirty    = false;
+volatile bool songDirty   = false;
+volatile bool logoReset   = false;
+volatile bool resolveReq  = false;        // demande de résolution de l'URL du flux (Tune.ashx)
+volatile bool resolveFail = false;        // la résolution a échoué
+volatile int  netReq      = 0;            // 1 = genres, 2 = stations d'un genre
+volatile bool listLoading = false;
+volatile bool listReady   = false;
+volatile bool listFail    = false;
+char reqGenre[160]   = "";
+char pendingUrl[300] = "";                // URL réelle du flux en cours
+char curEntry[96]    = "";                // entrée "id|Nom" de la station en lecture
+char apiStation[64]  = "";                // guide_id TuneIn de la station en lecture
+char songArtist[96]  = "";
+char songTitle[128]  = "";
+volatile uint32_t songSeq = 0;            // +1 à chaque changement de morceau vu dans le flux
+
+// ---- Lecture d'un fichier enregistré ----
+volatile bool     playFileReq = false;    // demande de lecture (tâche audio)
+volatile bool     pauseReq    = false;    // demande pause/reprise
+volatile uint32_t seekReq     = 0xFFFFFFFFu;
+volatile int      fileResult  = 0;        // 0 = en cours, 1 = ouvert, -1 = échec
+char     playFilePath[128] = "";
+int      fileIdx = -1;
+bool     fileOpened = false, filePaused = false, fileEnded = false, fileFailShown = false;
+uint32_t fileRunMs = 0;
+String   fArtist = "", fTitle = "";
+char     fileMsg[32] = "";
+uint32_t fpLastCur = 0xFFFFFFFFu, fpLastDur = 0xFFFFFFFFu;
+bool     fpForce = true;
+
+bool wifiOk = true;
+bool streamActive = false;
+uint32_t lastAudioOk = 0;
+uint32_t loadingSince = 0;
+
+// ---- Enregistrement SD ----
+SPIClass sdSPI(FSPI);                      // l'écran utilise HSPI (USE_HSPI_PORT)
+bool sdOk = false;
+bool recAuto = false;                      // arrêt automatique en fin de morceau (mémorisé)
+volatile bool     recWanted = false;       // demande de l'interface
+volatile bool     recActive = false;       // état réel (tâche d'enregistrement)
+volatile bool     recStateDirty = false;
+volatile int      recError = 0;            // 1 = SD absente, 2 = flux perdu, 3 = écriture SD, 4 = fin de morceau OK
+volatile uint32_t recDoneMs = 0;
+volatile uint32_t recBytes = 0;
+volatile uint32_t recStartMs = 0;
+char recStation[64] = "";                  // guide_id de la station enregistrée
+char recUrl[300] = "";                     // URL du flux enregistré
+char recLabel[64] = "";                    // nom de la station (nom de secours des fichiers)
+char recFile[96] = "";
+Client*           recClient = nullptr;
+WiFiClient*       recPlain  = nullptr;
+WiFiClientSecure* recSec    = nullptr;
+#define REC_TMP "/rec/_en_cours.tmp"
+const size_t RING_SZ  = 131072;                // file d'attente (puissance de 2), en PSRAM
+const size_t WR_CHUNK = 8192;                  // taille d'un bloc écrit sur la carte
+uint8_t* recRing = nullptr;
+std::atomic<size_t> ringHead(0), ringTail(0);
+volatile bool wrDone = false, wrErr = false, wrRunning = false;
+File recF;
+static uint8_t wrBuf[WR_CHUNK];
+
+// Logo de la station (tâche réseau -> loop)
+ImgSlot logoSlot  = { nullptr, 0, false };
+SemaphoreHandle_t imgMux;
+
+// Textes défilants
+Scroller scStation, scArtist, scTitle, hdrSc, scFArtist, scFTitle;
+
+// ArduinoJson : documents volumineux en PSRAM
+struct SpiRamAllocator : ArduinoJson::Allocator {
+  void* allocate(size_t n) override { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); }
+  void deallocate(void* p) override { heap_caps_free(p); }
+  void* reallocate(void* p, size_t n) override { return heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM); }
+};
+SpiRamAllocator spiRamAlloc;
+
+// ======================================================================
+//                              HORLOGE
+// ======================================================================
+TFT_eSprite spr = TFT_eSprite(&tft);
+
+// Géométrie : le cadran occupe un carré de 320x320, centré à l'horizontale
+const int FACE   = 320;
+const int CX     = 160;       // centre dans le sprite
+const int CY     = 160;
+const int FACE_X = 80;        // (480 - 320) / 2
+const int FACE_Y = 0;
+const int BAND_H = 40;
+const int NBANDS = FACE / BAND_H;
+
+const float R_FACE  = 158.0f;
+const float R_OUT   = 141.0f;
+const float R_IN    = 112.0f;
+const float R_INNER = 78.0f;
+
+const int TRAIL_N = 26;
+const float TRAIL_STEP = 2.5f;
+
+uint16_t colBlack, colFace, colBorder, colOff, colOn, colOnHi, colHour, colMin, colInner, colHubDark;
+uint16_t trailCol[TRAIL_N];
+
+int16_t segX[60][4], segY[60][4];
+int16_t segMinY[60], segMaxY[60];
+
+int yOff = 0;
+uint32_t lastFrame = 0;
+
+uint16_t mix565(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t b2, float t) {
+  return tft.color565(r1 + (r2 - r1) * t, g1 + (g2 - g1) * t, b1 + (b2 - b1) * t);
+}
+
+inline float cpx(float aDeg, float r) { return CX + r * sinf(aDeg * DEG_TO_RAD); }
+inline float cpy(float aDeg, float r) { return CY - r * cosf(aDeg * DEG_TO_RAD); }
+
+void tri(float x0, float y0, float x1, float y1, float x2, float y2, uint16_t c) {
+  spr.fillTriangle((int)(x0 + 0.5f), (int)(y0 + 0.5f) - yOff,
+                   (int)(x1 + 0.5f), (int)(y1 + 0.5f) - yOff,
+                   (int)(x2 + 0.5f), (int)(y2 + 0.5f) - yOff, c);
+}
+
+void thickLine(float x0, float y0, float x1, float y1, float w, uint16_t c) {
+  float dx = x1 - x0, dy = y1 - y0;
+  float len = sqrtf(dx * dx + dy * dy);
+  if (len < 0.01f) return;
+  float nx = -dy / len * w * 0.5f;
+  float ny =  dx / len * w * 0.5f;
+  tri(x0 + nx, y0 + ny, x0 - nx, y0 - ny, x1 + nx, y1 + ny, c);
+  tri(x0 - nx, y0 - ny, x1 - nx, y1 - ny, x1 + nx, y1 + ny, c);
+}
+
+void hand(float aDeg, float tail, float length, float width, uint16_t c) {
+  thickLine(cpx(aDeg, -tail), cpy(aDeg, -tail), cpx(aDeg, length), cpy(aDeg, length), width, c);
+}
+
+void initColors() {
+  colBlack   = tft.color565(0, 0, 0);
+  colFace    = tft.color565(14, 15, 19);
+  colBorder  = tft.color565(45, 46, 50);
+  colOff     = tft.color565(32, 33, 36);
+  colOn      = tft.color565(0, 190, 210);
+  colOnHi    = tft.color565(60, 235, 255);
+  colHour    = tft.color565(205, 205, 208);
+  colMin     = tft.color565(160, 160, 165);
+  colInner   = tft.color565(38, 40, 45);
+  colHubDark = tft.color565(6, 16, 20);
+
+  for (int k = 0; k < TRAIL_N; k++) {
+    float t = 0.42f * powf(1.0f - (float)k / TRAIL_N, 1.7f);
+    trailCol[k] = mix565(14, 15, 19, 0, 190, 210, t);
+  }
+}
+
+void initSegments() {
+  for (int i = 0; i < 60; i++) {
+    float a0 = i * 6.0f + 1.2f;
+    float a1 = (i + 1) * 6.0f - 1.2f;
+    segX[i][0] = cpx(a0, R_OUT); segY[i][0] = cpy(a0, R_OUT);
+    segX[i][1] = cpx(a1, R_OUT); segY[i][1] = cpy(a1, R_OUT);
+    segX[i][2] = cpx(a1, R_IN);  segY[i][2] = cpy(a1, R_IN);
+    segX[i][3] = cpx(a0, R_IN);  segY[i][3] = cpy(a0, R_IN);
+    int mn = 9999, mx = -9999;
+    for (int k = 0; k < 4; k++) {
+      if (segY[i][k] < mn) mn = segY[i][k];
+      if (segY[i][k] > mx) mx = segY[i][k];
+    }
+    segMinY[i] = mn - 1;
+    segMaxY[i] = mx + 1;
+  }
+}
+
+void drawBand(int secInt, float secAngle, float minAngle, float hourAngle) {
+  spr.fillSprite(colBlack);
+
+  spr.fillCircle(CX, CY - yOff, (int)R_FACE, colFace);
+  spr.drawCircle(CX, CY - yOff, (int)R_FACE + 1, colBorder);
+
+  for (int i = 0; i < 60; i++) {
+    if (segMaxY[i] < yOff || segMinY[i] >= yOff + BAND_H) continue;
+    uint16_t c = colOff;
+    if (i <= secInt) c = (i == secInt) ? colOnHi : colOn;
+    tri(segX[i][0], segY[i][0], segX[i][1], segY[i][1], segX[i][2], segY[i][2], c);
+    tri(segX[i][0], segY[i][0], segX[i][2], segY[i][2], segX[i][3], segY[i][3], c);
+  }
+
+  const float TR = R_IN - 3.0f;
+  for (int k = 0; k < TRAIL_N; k++) {
+    float a0 = secAngle - k * TRAIL_STEP;
+    float a1 = a0 - TRAIL_STEP - 0.3f;
+    tri(CX, CY, cpx(a0, TR), cpy(a0, TR), cpx(a1, TR), cpy(a1, TR), trailCol[k]);
+  }
+
+  spr.drawCircle(CX, CY - yOff, (int)R_INNER, colInner);
+
+  hand(hourAngle, 18, 88, 7, colHour);
+  hand(minAngle,  20, 122, 5, colMin);
+  hand(secAngle, 30, 132, 2.2f, colOnHi);
+
+  spr.fillCircle(CX, CY - yOff, 8, colOn);
+  spr.fillCircle(CX, CY - yOff, 4, colHubDark);
+}
+
+// Heure de secours : date/heure de compilation
+void setFallbackTime() {
+  static const char* mois[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+  char mon[4] = "Jan";
+  int day = 1, year = 2026, h = 0, m = 0, sec = 0;
+  sscanf(__DATE__, "%3s %d %d", mon, &day, &year);
+  sscanf(__TIME__, "%d:%d:%d", &h, &m, &sec);
+  int mi = 0;
+  for (int i = 0; i < 12; i++) if (strncmp(mon, mois[i], 3) == 0) mi = i;
+
+  setenv("TZ", TZ_INFO, 1);
+  tzset();
+  struct tm tmv = {};
+  tmv.tm_year = year - 1900;
+  tmv.tm_mon = mi;
+  tmv.tm_mday = day;
+  tmv.tm_hour = h;
+  tmv.tm_min = m;
+  tmv.tm_sec = sec;
+  tmv.tm_isdst = -1;
+  struct timeval tv = { mktime(&tmv), 0 };
+  settimeofday(&tv, nullptr);
+}
+
+// Une image de l'horloge (appelée à chaque tour de loop en mode horloge)
+void clockLoop() {
+  if (!spr.created()) return;
+  uint32_t now = millis();
+  if (now - lastFrame < FRAME_MS) return;
+  lastFrame = now;
+
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  struct tm t;
+  localtime_r(&tv.tv_sec, &t);
+
+  float ms = tv.tv_usec / 1000.0f;
+  float secF = SMOOTH_SECONDS ? (t.tm_sec + ms / 1000.0f) : (float)t.tm_sec;
+
+  float secAngle  = secF * 6.0f;
+  float minAngle  = (t.tm_min + t.tm_sec / 60.0f) * 6.0f;
+  float hourAngle = ((t.tm_hour % 12) + t.tm_min / 60.0f) * 30.0f;
+
+  for (int b = 0; b < NBANDS; b++) {
+    yOff = b * BAND_H;
+    drawBand(t.tm_sec, secAngle, minAngle, hourAngle);
+    spr.pushSprite(FACE_X, FACE_Y + yOff);
+  }
+}
+
+// ======================================================================
+//                               RADIO
+// ======================================================================
+
+// ---------------- Entrées "cle|Nom" ----------------
+const char* entryName(const char* e) {
+  const char* p = strchr(e, '|');
+  return p ? p + 1 : e;
+}
+
+void entryId(const char* e, char* out, size_t n) {
+  const char* p = strchr(e, '|');
+  size_t l = p ? (size_t)(p - e) : strlen(e);
+  if (l >= n) l = n - 1;
+  memcpy(out, e, l);
+  out[l] = 0;
+}
+
+bool sameId(const char* a, const char* b) {
+  while (*a && *a != '|' && *a == *b) { a++; b++; }
+  return (*a == 0 || *a == '|') && (*b == 0 || *b == '|');
+}
+
+// ---------------- Polices U8g2 (accents inclus, Latin-1) ----------------
+const uint8_t* const FONTS[4] = {
+  u8g2_font_profont29_tf, u8g2_font_profont22_tf,
+  u8g2_font_profont17_tf, u8g2_font_profont15_tf
+};
+
+void chopUtf8(String& s) {
+  if (!s.length()) return;
+  int i = s.length() - 1;
+  while (i > 0 && (s[i] & 0xC0) == 0x80) i--;
+  s.remove(i);
+}
+
+// Texte fixe (réduit puis tronqué) : utilisé pour les listes et la ligne d'état
+void drawTextFit(const String& text, int x, int yc, int maxW, uint16_t color, int firstFont) {
+  String t = text;
+  u8f.setForegroundColor(color);
+  int f = firstFont;
+  for (; f < 4; f++) {
+    u8f.setFont(FONTS[f]);
+    if (u8f.getUTF8Width(t.c_str()) <= maxW) break;
+  }
+  if (f >= 4) {
+    u8f.setFont(FONTS[3]);
+    while (t.length() > 1 && u8f.getUTF8Width((t + "~").c_str()) > maxW) chopUtf8(t);
+    t += "~";
+  }
+  int asc = u8f.getFontAscent(), desc = u8f.getFontDescent();
+  u8f.setCursor(x, yc + (asc + desc) / 2);
+  u8f.print(t);
+}
+
+// ---------------- Texte défilant ----------------
+void scrollInit(Scroller& s, int x, int y, int w, int h, uint16_t color, uint16_t bg, int fFirst, int fLast) {
+  s.x = x; s.y = y; s.w = w; s.h = h; s.color = color; s.bg = bg;
+  s.fFirst = fFirst; s.fLast = fLast;
+}
+
+void scrollRender(Scroller& s) {
+  tft.setViewport(s.x, s.y, s.w, s.h);
+  tft.fillRect(0, 0, s.w, s.h, s.bg);
+  u8f.setFont(FONTS[s.font]);
+  u8f.setForegroundColor(s.color);
+  int asc = u8f.getFontAscent(), desc = u8f.getFontDescent();
+  u8f.setCursor(s.scrolling ? -s.offset : 0, s.h / 2 + (asc + desc) / 2);
+  u8f.print(s.text);
+  tft.resetViewport();
+}
+
+void scrollSet(Scroller& s, const String& text) {
+  s.text = text.length() ? text : String("-");
+  int f = s.fFirst;
+  for (; f <= s.fLast; f++) {
+    u8f.setFont(FONTS[f]);
+    if (u8f.getUTF8Width(s.text.c_str()) <= s.w) break;
+  }
+  if (f > s.fLast) { f = s.fLast; u8f.setFont(FONTS[f]); s.scrolling = true; }
+  else s.scrolling = false;
+  s.font = f;
+  s.textW = u8f.getUTF8Width(s.text.c_str());
+  s.offset = 0; s.dir = 1;
+  s.pauseUntil = millis() + 1500;
+  s.lastStep = millis();
+  scrollRender(s);
+}
+
+void scrollTick(Scroller& s) {
+  if (!s.scrolling) return;
+  uint32_t now = millis();
+  if (now < s.pauseUntil || now - s.lastStep < 35) return;
+  s.lastStep = now;
+  int maxOff = s.textW - s.w + 8;
+  s.offset += s.dir * 2;
+  if (s.offset >= maxOff) { s.offset = maxOff; s.dir = -1; s.pauseUntil = now + 1200; }
+  else if (s.offset <= 0) { s.offset = 0;      s.dir = 1;  s.pauseUntil = now + 1200; }
+  scrollRender(s);
+}
+
+// ---------------- Étoile (favoris) ----------------
+void drawStar(int cx, int cy, int R, uint16_t color, bool filled) {
+  int sx[10], sy[10];
+  for (int i = 0; i < 10; i++) {
+    float a = -PI / 2 + i * PI / 5;
+    float r = (i % 2 == 0) ? R : R * 0.42f;
+    sx[i] = cx + (int)roundf(cosf(a) * r);
+    sy[i] = cy + (int)roundf(sinf(a) * r);
+  }
+  for (int i = 0; i < 10; i++) {
+    int j = (i + 1) % 10;
+    if (filled) tft.fillTriangle(cx, cy, sx[i], sy[i], sx[j], sy[j], color);
+    else        tft.drawLine(sx[i], sy[i], sx[j], sy[j], color);
+  }
+}
+
+// ---------------- Favoris : mémoire permanente ----------------
+// Clé "tifavs" : distincte des anciens favoris LautFM
+void favsLoad() {
+  favCount = 0;
+  prefs.begin("radio", true);
+  String s = prefs.getString("tifavs", "");
+  prefs.end();
+  int i = 0;
+  while (i < (int)s.length() && favCount < MAX_FAV) {
+    int e = s.indexOf('\n', i);
+    if (e < 0) e = s.length();
+    if (e > i) {
+      String n = s.substring(i, e);
+      strlcpy(favs[favCount++], n.c_str(), sizeof(favs[0]));
+    }
+    i = e + 1;
+  }
+}
+
+void favsSave() {
+  String s;
+  for (int i = 0; i < favCount; i++) { s += favs[i]; s += '\n'; }
+  prefs.begin("radio", false);
+  prefs.putString("tifavs", s);
+  prefs.end();
+}
+
+int favIndex(const char* entry) {
+  for (int i = 0; i < favCount; i++) if (sameId(favs[i], entry)) return i;
+  return -1;
+}
+bool isFav(const char* entry) { return entry[0] && favIndex(entry) >= 0; }
+
+void favToggle(const char* entry) {
+  if (!entry[0]) return;
+  int i = favIndex(entry);
+  if (i >= 0) {
+    for (int k = i; k < favCount - 1; k++) strlcpy(favs[k], favs[k + 1], sizeof(favs[0]));
+    favCount--;
+  } else if (favCount < MAX_FAV) {
+    strlcpy(favs[favCount++], entry, sizeof(favs[0]));
+  }
+  favsSave();
+}
+
+void favRemoveAt(int i) {
+  if (i < 0 || i >= favCount) return;
+  for (int k = i; k < favCount - 1; k++) strlcpy(favs[k], favs[k + 1], sizeof(favs[0]));
+  favCount--;
+  favsSave();
+}
+
+void favClear() {
+  favCount = 0;
+  favsSave();
+}
+
+// ---------------- Option REC AUTO : mémoire permanente ----------------
+void recAutoLoad() {
+  prefs.begin("radio", true);
+  recAuto = prefs.getBool("recauto", false);
+  prefs.end();
+}
+
+void recAutoSave() {
+  prefs.begin("radio", false);
+  prefs.putBool("recauto", recAuto);
+  prefs.end();
+}
+
+// ---------------- Message temporaire (ligne d'état de la liste) ----------------
+void toast(const char* m) {
+  strlcpy(toastMsg, m, sizeof(toastMsg));
+  toastUntil = millis() + 3000;
+}
+
+// ---------------- Décodage d'images -> TFT ----------------
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  if (y >= tft.height()) return 0;
+  tft.pushImage(x, y, w, h, bitmap);
+  return 1;
+}
+
+int fitScaleTo(uint16_t w, uint16_t h, int maxW, int maxH) {
+  int s = 1;
+  while (s < 8 && (w / s > maxW || h / s > maxH)) s *= 2;
+  return s;
+}
+
+#if USE_PNG
+PNG* pngObj = nullptr;
+int pngX0 = 0, pngY0 = 0;
+uint16_t pngLine[LOGO_S];
+
+int pngDraw(PNGDRAW* pDraw) {
+  pngObj->getLineAsRGB565(pDraw, pngLine, PNG_RGB565_BIG_ENDIAN, 0x00000000);
+  tft.pushImage(pngX0, pngY0 + pDraw->y, pDraw->iWidth, 1, pngLine);
+  return 1;
+}
+#endif
+
+// ---------------- Logo de la station ----------------
+void clearLogoBox() {
+  tft.fillRect(LOGO_X, LOGO_Y, LOGO_S, LOGO_S, TFT_BLACK);
+}
+
+void drawDefaultLogo() {
+  clearLogoBox();
+  const uint16_t c = TFT_DARKGREY;
+  tft.drawRoundRect(LOGO_X + 8, LOGO_Y + 28, 64, 42, 6, c);
+  tft.drawCircle(LOGO_X + 52, LOGO_Y + 49, 11, c);
+  tft.drawFastHLine(LOGO_X + 16, LOGO_Y + 40, 22, c);
+  tft.drawFastHLine(LOGO_X + 16, LOGO_Y + 49, 22, c);
+  tft.drawFastHLine(LOGO_X + 16, LOGO_Y + 58, 22, c);
+  tft.drawLine(LOGO_X + 20, LOGO_Y + 28, LOGO_X + 56, LOGO_Y + 8, c);
+}
+
+void drawLogo(uint8_t* buf, size_t len) {
+  if (!buf || len < 4) { drawDefaultLogo(); return; }
+
+  if (buf[0] == 0xFF && buf[1] == 0xD8) {                    // JPEG
+    uint16_t w = 0, h = 0;
+    TJpgDec.getJpgSize(&w, &h, buf, len);
+    if (w == 0 || h == 0) { drawDefaultLogo(); return; }
+    clearLogoBox();
+    int s = fitScaleTo(w, h, LOGO_S, LOGO_S);
+    TJpgDec.setJpgScale(s);
+    TJpgDec.drawJpg(LOGO_X + (LOGO_S - w / s) / 2,
+                    LOGO_Y + (LOGO_S - h / s) / 2, buf, len);
+    TJpgDec.setJpgScale(1);
+    return;
+  }
+
+#if USE_PNG
+  if (buf[0] == 0x89 && buf[1] == 'P') {                     // PNG
+    pngObj = new PNG();
+    int rc = pngObj->openRAM(buf, len, pngDraw);
+    if (rc == PNG_SUCCESS) {
+      int w = pngObj->getWidth(), h = pngObj->getHeight();
+      if (w > 0 && w <= LOGO_S && h <= LOGO_S) {
+        clearLogoBox();
+        pngX0 = LOGO_X + (LOGO_S - w) / 2;
+        pngY0 = LOGO_Y + (LOGO_S - h) / 2;
+        pngObj->decode(nullptr, 0);
+        pngObj->close();
+        delete pngObj; pngObj = nullptr;
+        return;
+      }
+      Serial.printf("Logo PNG trop grand : %dx%d\n", w, h);
+      pngObj->close();
+    }
+    delete pngObj; pngObj = nullptr;
+  }
+#endif
+
+  drawDefaultLogo();
+}
+
+// ---------------- Téléchargement d'image (tâche réseau) ----------------
+bool downloadImage(const String& url, uint8_t** outBuf, size_t* outLen, bool allowPng) {
+  WiFiClientSecure sclient;
+  WiFiClient pclient;
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  bool ok;
+  if (url.startsWith("https")) { sclient.setInsecure(); ok = http.begin(sclient, url); }
+  else                         { ok = http.begin(pclient, url); }
+  if (!ok) return false;
+
+  if (http.GET() != HTTP_CODE_OK) { http.end(); return false; }
+
+  int len = http.getSize();
+  if (len <= 0 || len > 200000) { http.end(); return false; }
+
+  uint8_t* b = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+  if (!b) b = (uint8_t*)malloc(len);
+  if (!b) { http.end(); return false; }
+
+  WiFiClient* s = http.getStreamPtr();
+  int got = 0;
+  uint32_t lastByte = millis();
+  while (got < len && millis() - lastByte < 8000) {
+    int av = s->available();
+    if (av > 0) {
+      got += s->readBytes(b + got, min(av, len - got));
+      lastByte = millis();
+    } else if (!s->connected()) break;
+    else vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  http.end();
+
+  bool isJpeg = (len >= 4 && b[0] == 0xFF && b[1] == 0xD8);
+  bool isPng  = (len >= 4 && b[0] == 0x89 && b[1] == 'P');
+  if (got != len || !(isJpeg || (allowPng && isPng))) {
+    if (got == len) Serial.println("Format d'image non gere (ni JPEG ni PNG autorise)");
+    free(b);
+    return false;
+  }
+
+  *outBuf = b; *outLen = len;
+  return true;
+}
+
+void publishImg(ImgSlot& slot, uint8_t* b, size_t l) {
+  xSemaphoreTake(imgMux, portMAX_DELAY);
+  if (slot.buf) free(slot.buf);
+  slot.buf = b; slot.len = l; slot.ready = true;
+  xSemaphoreGive(imgMux);
+}
+
+// ---------------- Enregistrement du flux sur SD ----------------
+bool sdInit() {
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  sdOk = SD.begin(SD_CS, sdSPI, SD_FREQ);
+  Serial.println(sdOk ? "SD OK" : "SD absente ou erreur");
+  return sdOk;
+}
+
+void recCleanupClient() {
+  if (recClient) recClient->stop();
+  if (recPlain) { delete recPlain; recPlain = nullptr; }
+  if (recSec)   { delete recSec;   recSec   = nullptr; }
+  recClient = nullptr;
+}
+
+// Envoie la requête GET et lit les en-têtes de réponse
+// wantIcy : demande les titres dans le flux ; metaint : intervalle des blocs de titres (0 = aucun)
+bool httpOpen(Client& c, const char* host, const char* path, bool wantIcy,
+              String& ctype, String& loc, int& status, int& metaint) {
+  String req = String("GET ") + path + " HTTP/1.0\r\nHost: " + host +
+               "\r\nUser-Agent: ESP32-Radio\r\nAccept: */*\r\n" +
+               (wantIcy ? "Icy-MetaData: 1\r\n" : "") + "Connection: close\r\n\r\n";
+  c.print(req);
+
+  uint32_t t0 = millis();
+  String line;
+  bool first = true;
+  status = 0;
+  metaint = 0;
+  while (millis() - t0 < 10000) {
+    if (!c.available()) {
+      if (!c.connected()) return false;
+      delay(5);
+      continue;
+    }
+    char ch = c.read();
+    if (ch == '\r') continue;
+    if (ch == '\n') {
+      if (first) {
+        first = false;
+        int sp = line.indexOf(' ');
+        status = (sp > 0) ? line.substring(sp + 1).toInt() : 0;
+      } else if (line.length() == 0) {
+        return true;                                   // fin des en-têtes
+      } else {
+        String l = line; l.toLowerCase();
+        if (l.startsWith("content-type:")) { ctype = l.substring(13); ctype.trim(); }
+        else if (l.startsWith("location:")) { loc = line.substring(9); loc.trim(); }
+        else if (l.startsWith("icy-metaint:")) { metaint = l.substring(12).toInt(); }
+      }
+      line = "";
+    } else {
+      line += ch;
+      if (line.length() > 400) line = "";
+    }
+  }
+  return false;
+}
+
+// Ouvre le flux (HTTP simple ou TLS, avec suivi des redirections)
+bool recOpenStream(const char* startUrl, String& ctype, bool wantIcy, int& metaint) {
+  String url = startUrl;
+  for (int hop = 0; hop < 4; hop++) {
+    bool tls = url.startsWith("https://");
+    String rest = url.substring(tls ? 8 : 7);
+    int sl = rest.indexOf('/');
+    String host = (sl >= 0) ? rest.substring(0, sl) : rest;
+    String path = (sl >= 0) ? rest.substring(sl) : String("/");
+    int port = tls ? 443 : 80;
+    int colon = host.indexOf(':');
+    if (colon > 0) { port = host.substring(colon + 1).toInt(); host = host.substring(0, colon); }
+
+    recCleanupClient();
+    bool connected;
+    if (tls) {
+      recSec = new WiFiClientSecure();
+      recSec->setInsecure();
+      connected = recSec->connect(host.c_str(), port, 8000);
+      recClient = recSec;
+    } else {
+      recPlain = new WiFiClient();
+      connected = recPlain->connect(host.c_str(), port, 8000);
+      recClient = recPlain;
+    }
+    if (!connected) return false;
+
+    String loc; int status = 0;
+    ctype = "";
+    if (!httpOpen(*recClient, host.c_str(), path.c_str(), wantIcy, ctype, loc, status, metaint)) return false;
+    if (status == 200) return true;
+    if (status >= 300 && status < 400 && loc.length()) {
+      if (loc.startsWith("/")) loc = String(tls ? "https://" : "http://") + host + loc;
+      url = loc;
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+// ---------------- Noms de fichiers à partir du titre ----------------
+// Lettres latines accentuées U+00C0..U+00FF -> équivalent ASCII
+static const char LATIN1_ASCII[] = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTsaaaaaaaceeeeiiiidnooooo-ouuuuyty";
+
+// Texte (UTF-8 ou Latin-1) -> nom de fichier sûr pour une carte FAT
+String fileSafe(const String& in) {
+  String out;
+  const uint8_t* p = (const uint8_t*)in.c_str();
+  while (*p) {
+    uint32_t cp;
+    if (*p < 0x80) { cp = *p++; }
+    else if ((*p & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) { cp = ((*p & 0x1F) << 6) | (p[1] & 0x3F); p += 2; }
+    else if ((*p & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+      cp = ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); p += 3;
+    }
+    else if ((*p & 0xF8) == 0xF0) { p++; while ((*p & 0xC0) == 0x80) p++; continue; }   // emoji, etc.
+    else { cp = *p++; }                                                                  // Latin-1 brut
+
+    char c;
+    if (cp < 0x80) c = (char)cp;
+    else if (cp >= 0xC0 && cp <= 0xFF) c = LATIN1_ASCII[cp - 0xC0];
+    else if (cp >= 0x2018 && cp <= 0x201F) c = '\'';
+    else if (cp == 0x2013 || cp == 0x2014) c = '-';
+    else if (cp == 0x152 || cp == 0x153) c = 'o';
+    else continue;
+
+    if (c < 32 || c == '*' || c == '?') continue;
+    if (c == '"') c = '\'';
+    if (c == '\\' || c == '/' || c == ':' || c == '|' || c == '<' || c == '>') c = '-';
+    if (c == ' ' && (out.length() == 0 || out[out.length() - 1] == ' ')) continue;
+    out += c;
+    if (out.length() >= 80) break;
+  }
+  while (out.length() && (out[out.length() - 1] == ' ' || out[out.length() - 1] == '.'))
+    out.remove(out.length() - 1);
+  return out;
+}
+
+// Chemin libre : "Titre.mp3", puis "Titre (2).mp3", etc.
+String uniqueRecPath(const String& base, const char* ext) {
+  String p = "/rec/" + base + "." + ext;
+  for (int i = 2; i < 100 && SD.exists(p.c_str()); i++)
+    p = "/rec/" + base + " (" + String(i) + ")." + ext;
+  return p;
+}
+
+static bool sdWriteRetry(const uint8_t* p, size_t n) {
+  size_t done = 0;
+  int fails = 0;
+  while (done < n) {
+    size_t w = recF.write(p + done, n - done);
+    if (w > 0) { done += w; continue; }
+    fails++;
+    Serial.printf("SD ecriture : echec %d\n", fails);
+    if (fails > 8) return false;
+    if (fails == 3 || fails == 6) {                    // réouverture du fichier
+      recF.close();
+      vTaskDelay(pdMS_TO_TICKS(200));
+      if (fails == 6) { SD.end(); vTaskDelay(pdMS_TO_TICKS(100)); sdInit(); }
+      recF = SD.open(REC_TMP, FILE_APPEND);
+    }
+    vTaskDelay(pdMS_TO_TICKS(150 * fails));
+  }
+  return true;
+}
+
+// Vide la file d'attente vers la carte SD
+void sdWriterTask(void*) {
+  uint32_t lastFlush = millis();
+  for (;;) {
+    size_t head = ringHead.load(std::memory_order_acquire);
+    size_t tail = ringTail.load(std::memory_order_relaxed);
+    size_t avail = head - tail;
+    if (avail >= WR_CHUNK || (wrDone && avail > 0)) {
+      size_t pos = tail & (RING_SZ - 1);
+      size_t n = min(avail, (size_t)WR_CHUNK);
+      n = min(n, RING_SZ - pos);
+      memcpy(wrBuf, recRing + pos, n);
+      if (!sdWriteRetry(wrBuf, n)) { wrErr = true; break; }
+      ringTail.store(tail + n, std::memory_order_release);
+      if (millis() - lastFlush > 4000) { recF.flush(); lastFlush = millis(); }
+    } else if (wrDone) {
+      break;
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+  recF.close();
+  wrRunning = false;
+  vTaskDelete(nullptr);
+}
+
+void recordSession() {
+  String ctype;
+  int metaint = 0;
+  const bool autoMode = recAuto;                       // option figée au démarrage
+  recBytes = 0;
+
+  if (!recRing) recRing = (uint8_t*)heap_caps_malloc(RING_SZ, MALLOC_CAP_SPIRAM);
+  if (!recRing) { recError = 3; recWanted = false; recStateDirty = true; return; }
+
+  // On demande toujours les titres dans le flux : ils servent à nommer le fichier
+  if (!recOpenStream(recUrl, ctype, true, metaint)) {
+    recCleanupClient();
+    recError = 2; recWanted = false; recStateDirty = true;
+    return;
+  }
+
+  const bool useIcy = metaint > 0;                     // le serveur envoie les titres dans le flux
+  const bool useApi = autoMode && !useIcy;             // secours : changement de titre vu par la lecture
+
+  const char* ext = (ctype.indexOf("aac") >= 0) ? "aac" : (ctype.indexOf("ogg") >= 0 ? "ogg" : "mp3");
+  SD.mkdir("/rec");
+
+  // Nom de secours (sans titre) : <station>_AAAAMMJJ_HHMMSS
+  time_t now0 = time(nullptr);
+  struct tm tm0;
+  localtime_r(&now0, &tm0);
+  char stamp[80];
+  snprintf(stamp, sizeof(stamp), "%.40s_%04d%02d%02d_%02d%02d%02d",
+           recLabel, tm0.tm_year + 1900, tm0.tm_mon + 1, tm0.tm_mday, tm0.tm_hour, tm0.tm_min, tm0.tm_sec);
+
+  // Fichier temporaire, renommé à la fin avec le titre du morceau
+  const char* TMP = REC_TMP;
+  SD.remove(TMP);
+  recF = SD.open(TMP, FILE_WRITE);
+  if (!recF) {
+    recCleanupClient();
+    recError = 1; recWanted = false; recStateDirty = true;
+    return;
+  }
+
+  // Tâche d'écriture sur la carte
+  ringHead.store(0, std::memory_order_release);
+  ringTail.store(0, std::memory_order_release);
+  wrDone = false; wrErr = false; wrRunning = true;
+  xTaskCreatePinnedToCore(sdWriterTask, "sdw", 6144, nullptr, 2, nullptr, 0);
+  Serial.printf("REC -> %s (auto=%d, icy=%d, metaint=%d)\n", TMP, (int)autoMode, (int)useIcy, metaint);
+
+  recStartMs = millis();
+  recActive = true;
+  recStateDirty = true;
+
+  int err = 0;
+  bool autoDone = false;
+  size_t h = 0;                                        // octets audio mis dans la file
+  uint32_t lastData = millis();
+
+  // --- Démultiplexage des blocs de titres (ICY) ---
+  static uint8_t rawBuf[1024];
+  static char metaBuf[4100];
+  int st = 0;                       // 0 = audio, 1 = octet de longueur, 2 = bloc de titre
+  int untilMeta = metaint;
+  int metaNeed = 0, metaLen = 0;
+  String icyTitle;                  // premier titre reçu = morceau enregistré
+  bool icyHave = false;
+
+  // --- Titre vu par la lecture (nom de secours et surveillance AUTO si pas d'ICY) ---
+  uint32_t apiBase = songSeq;
+  bool apiBaseSet = (songSeq != 0);
+  uint32_t tailDeadline = 0;
+  String apiArtist, apiTitle;
+  bool apiCaptured = false;
+  if (songTitle[0]) { apiTitle = String(songTitle); apiArtist = String(songArtist); apiCaptured = true; }
+
+  while (recWanted) {
+    if (WiFi.status() != WL_CONNECTED) { err = 2; break; }
+    if (wrErr) { err = 3; break; }
+
+    int av = recClient->available();
+    if (av > 0) {
+      int n = recClient->read(rawBuf, min(av, (int)sizeof(rawBuf)));
+      if (n > 0) {
+        lastData = millis();
+        for (int i = 0; i < n && !autoDone; i++) {
+          uint8_t b = rawBuf[i];
+
+          if (!useIcy || st == 0) {                    // octet audio -> file d'attente
+            if (h - ringTail.load(std::memory_order_acquire) >= RING_SZ) {      // file pleine : on attend la carte
+              ringHead.store(h, std::memory_order_release);
+              uint32_t tw = millis();
+              while (h - ringTail.load(std::memory_order_acquire) >= RING_SZ && !wrErr && recWanted) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                if (millis() - tw > 15000) { err = 3; break; }
+              }
+              if (wrErr) err = 3;
+              if (err || !recWanted) break;
+            }
+            recRing[h & (RING_SZ - 1)] = b;
+            h++;
+            if (useIcy && --untilMeta == 0) st = 1;
+          } else if (st == 1) {                        // octet de longueur (x16)
+            int L = b * 16;
+            if (L == 0) { st = 0; untilMeta = metaint; }
+            else { metaNeed = L; metaLen = 0; st = 2; }
+          } else {                                     // bloc de titre, retiré du fichier
+            if (metaLen < (int)sizeof(metaBuf) - 1) metaBuf[metaLen++] = b;
+            if (--metaNeed == 0) {
+              metaBuf[metaLen] = 0;
+              st = 0;
+              untilMeta = metaint;
+
+              const char* p = strstr(metaBuf, "StreamTitle='");
+              if (p) {
+                p += 13;
+                const char* e = strstr(p, "';");
+                String ti = e ? String(p).substring(0, (unsigned)(e - p)) : String(p);
+                ti.trim();
+                if (ti.length()) {
+                  if (!icyHave) {
+                    icyHave = true;
+                    icyTitle = ti;
+                    Serial.println("REC titre de depart : " + ti);
+                  } else if (ti != icyTitle && autoMode) {
+                    Serial.println("REC nouveau titre : " + ti);
+                    autoDone = true;                   // fin exacte du morceau
+                  }
+                }
+              }
+            }
+          }
+        }
+        ringHead.store(h, std::memory_order_release);  // publie les octets au rédacteur
+        recBytes = (uint32_t)h;
+        if (err || autoDone) break;
+      }
+    } else {
+      if (!recClient->connected()) { err = 2; break; }
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // Titre de la lecture : mémorisé dès qu'il est disponible (nom de secours)
+    if (!apiCaptured && songTitle[0]) { apiTitle = String(songTitle); apiArtist = String(songArtist); apiCaptured = true; }
+
+    // Secours AUTO : changement de morceau vu par la lecture, puis délai de rattrapage
+    if (useApi) {
+      if (!apiBaseSet) {
+        if (songSeq != 0) { apiBase = songSeq; apiBaseSet = true; }
+      } else if (songSeq != apiBase && tailDeadline == 0) {
+        tailDeadline = millis() + REC_TAIL_MS;
+        Serial.println("REC changement de morceau, arret dans quelques secondes");
+      }
+      if (tailDeadline && millis() >= tailDeadline) { autoDone = true; break; }
+    }
+
+    if (millis() - lastData > 15000) { err = 2; break; }
+  }
+
+  // Fin : on laisse la tâche d'écriture vider la file, puis fermer le fichier
+  ringHead.store(h, std::memory_order_release);
+  wrDone = true;
+  uint32_t tj = millis();
+  while (wrRunning && millis() - tj < 30000) vTaskDelay(pdMS_TO_TICKS(20));
+  if (wrRunning) { Serial.println("Ecriture SD bloquee"); if (!err) err = 3; }
+  else if (wrErr && err == 0) err = 3;
+  recBytes = (uint32_t)ringTail.load(std::memory_order_acquire);
+  recCleanupClient();
+
+  // --- Nom définitif : titre du morceau ---
+  if (wrRunning) {
+    recFile[0] = 0;                                    // fichier encore ouvert : on ne touche à rien
+  } else if (recBytes == 0) {
+    SD.remove(TMP);                                    // rien d'enregistré
+    recFile[0] = 0;
+  } else {
+    String artistPart, titlePart;
+    if (icyHave) {                                     // "Artiste - Titre" envoyé dans le flux
+      int p = icyTitle.indexOf(" - ");
+      if (p > 0) { artistPart = icyTitle.substring(0, p); titlePart = icyTitle.substring(p + 3); }
+      else       { titlePart = icyTitle; }
+    } else if (apiCaptured) {
+      artistPart = apiArtist; titlePart = apiTitle;
+    }
+    String label;
+    if (REC_NAME_WITH_ARTIST && artistPart.length() && titlePart.length()) label = artistPart + " - " + titlePart;
+    else label = titlePart.length() ? titlePart : artistPart;
+
+    String base = fileSafe(label);
+    if (!base.length()) base = fileSafe(String(stamp));           // pas de titre : nom de secours
+    String finalPath = uniqueRecPath(base, ext);
+    if (SD.rename(TMP, finalPath.c_str())) {
+      strlcpy(recFile, finalPath.c_str(), sizeof(recFile));
+    } else {
+      Serial.println("Renommage impossible : fichier laisse sous " + String(TMP));
+      strlcpy(recFile, TMP, sizeof(recFile));
+    }
+  }
+  Serial.printf("REC termine : %s, %u octets, erreur %d, fin de morceau %d\n",
+                recFile, (unsigned)recBytes, err, (int)autoDone);
+
+  recActive = false;
+  recWanted = false;
+  if (autoDone && err == 0) { recError = 4; recDoneMs = millis(); }
+  else                      { recError = err; }
+  recStateDirty = true;
+}
+
+void recTask(void*) {
+  for (;;) {
+    if (recWanted && !recActive) recordSession();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// Bouton REC : démarre / arrête
+void recToggle() {
+  if (recWanted || recActive) { recWanted = false; return; }       // arrêt
+  if (!pendingUrl[0] || !apiStation[0]) return;                    // aucun flux en cours
+  if (!sdOk && !sdInit()) { recError = 1; recStateDirty = true; return; }
+  recError = 0;
+  strlcpy(recStation, apiStation, sizeof(recStation));
+  strlcpy(recUrl, pendingUrl, sizeof(recUrl));
+  strlcpy(recLabel, fileSafe(curStation).c_str(), sizeof(recLabel));
+  recBytes = 0;
+  recWanted = true;                                                // la tâche démarre
+  recStateDirty = true;
+}
+
+// ---------------- Liste des enregistrements (carte SD) ----------------
+bool isAudioName(const char* n) {
+  size_t l = strlen(n);
+  if (l < 5) return false;
+  const char* e = n + l - 4;
+  return !strcasecmp(e, ".mp3") || !strcasecmp(e, ".aac") || !strcasecmp(e, ".ogg");
+}
+
+int cmpRec(const void* a, const void* b) {
+  const RecEntry* x = (const RecEntry*)a;
+  const RecEntry* y = (const RecEntry*)b;
+  if (x->t != y->t) return (x->t > y->t) ? -1 : 1;        // plus récent d'abord
+  return strcasecmp(x->name, y->name);
+}
+
+void recScan() {
+  recCount = 0;
+  if (!recList) return;
+  if (!sdOk && !sdInit()) return;
+
+  File dir = SD.open("/rec");
+  if (!dir) { Serial.println("/rec absent"); return; }
+  if (!dir.isDirectory()) { dir.close(); return; }
+
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory() && recCount < MAX_REC) {
+      const char* full = f.name();
+      const char* nm = strrchr(full, '/');
+      nm = nm ? nm + 1 : full;
+      if (nm[0] != '_' && nm[0] != '.' && isAudioName(nm)) {
+        RecEntry& e = recList[recCount++];
+        strlcpy(e.name, nm, sizeof(e.name));
+        e.size = (uint32_t)f.size();
+        e.t = (uint32_t)f.getLastWrite();
+      }
+    }
+    f.close();
+    f = dir.openNextFile();
+  }
+  dir.close();
+  qsort(recList, recCount, sizeof(RecEntry), cmpRec);
+  Serial.printf("%d enregistrements\n", recCount);
+}
+
+void recDelete(int idx) {
+  if (idx < 0 || idx >= recCount) return;
+  String p = String("/rec/") + recList[idx].name;
+  bool ok = SD.remove(p.c_str());
+  Serial.printf("Suppression %s : %s\n", p.c_str(), ok ? "OK" : "echec");
+  recScan();
+}
+
+// Nom de fichier -> "Artiste" / "Titre" (sans extension)
+void fileNameParts(const char* name, String& artist, String& title) {
+  char base[100];
+  strlcpy(base, name, sizeof(base));
+  char* d = strrchr(base, '.');
+  if (d) *d = 0;
+  String s(base);
+  int p = s.indexOf(" - ");
+  if (p > 0) { artist = s.substring(0, p); title = s.substring(p + 3); }
+  else       { artist = ""; title = s; }
+}
+
+void fmtSize(char* out, size_t n, uint32_t sz) {
+  if (sz >= 1048576UL) snprintf(out, n, "%.1f Mo", sz / 1048576.0f);
+  else                 snprintf(out, n, "%u Ko", (unsigned)(sz / 1024));
+}
+
+void fmtTime(char* out, size_t n, uint32_t s) {
+  if (s >= 3600) snprintf(out, n, "%u:%02u:%02u", (unsigned)(s / 3600), (unsigned)((s / 60) % 60), (unsigned)(s % 60));
+  else           snprintf(out, n, "%02u:%02u", (unsigned)(s / 60), (unsigned)(s % 60));
+}
+
+// ---------------- Audio (tâche dédiée, cœur 1) ----------------
+void audioTask(void*) {
+  for (;;) {
+    if (stopStream) {
+      stopStream = false;
+      newStream = false;
+      audio.stopSong();
+    }
+    if (newStream) {
+      newStream = false;
+      audio.stopSong();
+      audio.setVolume(volume);
+      audio.connecttohost(pendingUrl);
+    }
+    if (playFileReq) {                                  // lecture d'un fichier de la carte SD
+      playFileReq = false;
+      newStream = false;
+      audio.stopSong();
+      audio.setVolume(volume);
+      fileResult = audio.connecttoFS(SD, playFilePath) ? 1 : -1;
+    }
+    if (pauseReq) { pauseReq = false; audio.pauseResume(); }
+#if USE_SEEK
+    if (seekReq != 0xFFFFFFFFu) {
+      uint32_t p = seekReq;
+      seekReq = 0xFFFFFFFFu;
+      audio.setFilePos(p);
+    }
+#endif
+    if (volDirty) { volDirty = false; audio.setVolume(volume); }
+    audio.loop();
+    vTaskDelay(1);
+  }
+}
+
+// ---------------- TuneIn : genres, stations, résolution du flux, logo, titres ----------------
+#include "tunein.h"
+
+// ---------------- Tâche réseau unique (cœur 0) ----------------
+void apiTask(void*) {
+  for (;;) {
+    // --- Requêtes de listes (genres / stations d'un genre) ---
+    int req = netReq;
+    if (req) {
+      netReq = 0;
+      bool ok = false;
+      if (WiFi.status() == WL_CONNECTED) {
+        if (req == 1) ok = fetchGenres();
+        else if (req == 2) {
+          char g[160];
+          strlcpy(g, reqGenre, sizeof(g));
+          ok = fetchGenreStations(g);
+        }
+      }
+      listFail = !ok;
+      listReady = true;
+    }
+
+    // --- Résolution de l'URL du flux (Tune.ashx) ---
+    if (resolveReq && WiFi.status() == WL_CONNECTED) {
+      resolveReq = false;
+      char id[24], url[300];
+      strlcpy(id, apiStation, sizeof(id));
+      bool ok = id[0] && resolveStream(id, url, sizeof(url));
+      if (strcmp(id, apiStation) == 0) {              // la station n'a pas changé entre-temps
+        if (ok) { strlcpy(pendingUrl, url, sizeof(pendingUrl)); newStream = true; }
+        else resolveFail = true;
+      }
+    }
+
+    // --- Logo de la station ---
+    if (logoReset && WiFi.status() == WL_CONNECTED) {
+      logoReset = false;
+      char id[24];
+      strlcpy(id, apiStation, sizeof(id));
+      if (id[0]) fetchStationInfo(id);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
+
+// ---------------- Tactile FT6336U ----------------
+void touchInit() {
+  if (TP_RST >= 0) {
+    pinMode(TP_RST, OUTPUT);
+    digitalWrite(TP_RST, LOW);  delay(10);
+    digitalWrite(TP_RST, HIGH); delay(100);
+  }
+  Wire.begin(TP_SDA, TP_SCL, 400000);
+}
+
+// Retourne le nombre de doigts (0, 1 ou 2) ; x,y = premier doigt, repère paysage
+int readTouch(uint16_t &x, uint16_t &y) {
+  Wire.beginTransmission(TP_ADDR);
+  Wire.write(0x02);
+  if (Wire.endTransmission(false) != 0) return 0;
+  if (Wire.requestFrom((uint8_t)TP_ADDR, (uint8_t)5) != 5) return 0;
+
+  uint8_t n  = Wire.read() & 0x0F;
+  uint8_t xh = Wire.read();
+  uint8_t xl = Wire.read();
+  uint8_t yh = Wire.read();
+  uint8_t yl = Wire.read();
+  if (n == 0 || n > 2) return 0;
+
+  uint16_t rawX = ((xh & 0x0F) << 8) | xl;
+  uint16_t rawY = ((yh & 0x0F) << 8) | yl;
+  x = rawY;
+  y = (PANEL_W - 1) - rawX;
+  return n;
+}
+
+// ---------------- Allocation des listes en PSRAM ----------------
+bool allocBuffers() {
+  genBuf  = (char*)      heap_caps_malloc(GENBUF_SIZE,      MALLOC_CAP_SPIRAM);
+  genOff  = (uint32_t*)  heap_caps_malloc(MAX_GENRES * 4,   MALLOC_CAP_SPIRAM);
+  gsBuf   = (char*)      heap_caps_malloc(GSBUF_SIZE,       MALLOC_CAP_SPIRAM);
+  gsOff   = (uint32_t*)  heap_caps_malloc(MAX_GS * 4,       MALLOC_CAP_SPIRAM);
+  recList = (RecEntry*)  heap_caps_malloc(MAX_REC * sizeof(RecEntry), MALLOC_CAP_SPIRAM);
+  if (!genBuf || !genOff || !gsBuf || !gsOff || !recList) {
+    Serial.println("ERREUR : allocation PSRAM impossible (PSRAM = OPI activee ?)");
+    return false;
+  }
+  return true;
+}
+
+// ---------------- Liste courante (selon le mode) ----------------
+bool genreListView() { return mode == M_GENRE && !genreStationsView; }
+
+int listCount() {
+  if (mode == M_FAV) return favCount;
+  if (mode == M_REC) return recCount;
+  return genreStationsView ? gsCount : genreCount;
+}
+
+// Retourne l'entrée complète ("id|Nom") ; pour l'affichage utiliser entryName()
+const char* listName(int i) {
+  if (mode == M_FAV) return favs[i];
+  if (mode == M_REC) return recList[i].name;
+  return genreStationsView ? gsBuf + gsOff[i] : genBuf + genOff[i];
+}
+
+void requestGenres() {
+  listFail = false;
+  loadingSince = millis();
+  listLoading = true;
+  netReq = 1;
+}
+
+void requestGenreStations(int gi) {
+  genreCur = gi;
+  genreStationsView = true;
+  strlcpy(reqGenre, genBuf + genOff[gi], sizeof(reqGenre));
+  gsCount = 0;
+  topIdx = 0;
+  listFail = false;
+  loadingSince = millis();
+  listLoading = true;
+  netReq = 2;
+}
+
+void setMode(Mode m) {
+  mode = m;
+  topIdx = 0;
+  listFail = false;
+  if (m == M_GENRE && genreCount == 0 && !listLoading) requestGenres();
+  if (m == M_REC) recScan();
+}
+
+// ---------------- En-tête : texte d'état ----------------
+String hdrText() {
+  if (!wifiOk) return "WiFi perdu - reconnexion...";
+  if (curStation.length() == 0) return "Choisis une station";
+  String t = "> " + curStation;
+  if (curArtist.length() || curTitle.length()) t += " : " + curArtist + " - " + curTitle;
+  return t;
+}
+
+// ---------------- Affichage : page liste ----------------
+void drawListHeader() {
+  tft.fillRect(0, 0, SCR_W, HEADER_H, TFT_NAVY);
+  char v[8];
+  snprintf(v, sizeof(v), "%d", volume);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextSize(1);
+  tft.drawString(v, SCR_W - 8, HEADER_H / 2, 2);
+  scrollSet(hdrSc, hdrText());
+  if (recWanted || recActive) tft.fillCircle(SCR_W - 42, HEADER_H / 2, 6, TFT_RED);   // témoin REC
+}
+
+void updateHeaderText() {
+  if (page != PAGE_LIST) return;
+  String t = hdrText();
+  if (t != hdrSc.text) scrollSet(hdrSc, t);
+}
+
+void drawList() {
+  tft.fillRect(0, LIST_Y, SCR_W, ROWS * ROW_H + 22, TFT_BLACK);
+  tft.setTextSize(1);
+
+  if (listLoading || listFail || listCount() == 0) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(listFail ? TFT_RED : TFT_LIGHTGREY, TFT_BLACK);
+    const char* msg = listLoading ? "Chargement..."
+                    : listFail    ? "Erreur reseau"
+                    : (mode == M_FAV ? "Aucun favori - appuie sur l'etoile"
+                    : (mode == M_REC ? (sdOk ? "Aucun enregistrement" : "Carte SD absente")
+                    : "Aucune station"));
+    tft.drawString(msg, SCR_W / 2, LIST_Y + 3 * ROW_H, 4);
+    return;
+  }
+
+  int cnt = listCount();
+  bool genres = genreListView();
+  tft.setTextDatum(ML_DATUM);
+  for (int r = 0; r < ROWS; r++) {
+    int idx = topIdx + r;
+    if (idx >= cnt) break;
+    int y = LIST_Y + r * ROW_H;
+    tft.drawFastHLine(0, y + ROW_H - 1, SCR_W, TFT_DARKGREY);
+    const char* ent = listName(idx);
+    const char* nm  = (mode == M_REC) ? ent : entryName(ent);
+
+    if (genres) {
+      drawTextFit(String(nm), 10, y + ROW_H / 2, SCR_W - 30, TFT_WHITE, 1);
+
+    } else if (mode == M_REC) {
+      char base[100];
+      strlcpy(base, nm, sizeof(base));
+      char* dot = strrchr(base, '.');
+      if (dot) *dot = 0;
+      String s(base);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setTextDatum(ML_DATUM);
+      int maxw = SCR_W - 100;
+      if (tft.textWidth(s, 4) > maxw) {
+        while (s.length() > 3 && tft.textWidth(s + "~", 4) > maxw) s.remove(s.length() - 1);
+        s += "~";
+      }
+      tft.drawString(s, 10, y + ROW_H / 2, 4);
+      char sz[16];
+      fmtSize(sz, sizeof(sz), recList[idx].size);
+      tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      tft.setTextDatum(MR_DATUM);
+      tft.drawString(sz, SCR_W - 8, y + ROW_H / 2, 2);
+
+    } else {
+      // Nom de station : police U8g2 (accents, caractères non latins gérés au mieux)
+      drawTextFit(String(nm), 10, y + ROW_H / 2, SCR_W - 60, TFT_WHITE, 1);
+      if (isFav(ent)) drawStar(SCR_W - 24, y + ROW_H / 2, 10, TFT_YELLOW, true);
+    }
+  }
+
+  // Ligne d'état : contexte à gauche, compteur à droite
+  int yl = LIST_Y + ROWS * ROW_H + 12;
+  String ctx;
+  uint16_t ctxCol = TFT_LIGHTGREY;
+  if (millis() < toastUntil)  { ctx = toastMsg; ctxCol = TFT_ORANGE; }
+  else if (mode == M_FAV)     ctx = "Favoris - appui long: suppr. / centre: vider";
+  else if (mode == M_REC)     ctx = "Enregistrements - appui long: supprimer";
+  else if (genreStationsView && genreCur >= 0) ctx = String(entryName(genBuf + genOff[genreCur]));
+  else                        ctx = "Genres TuneIn";
+  drawTextFit(ctx, 8, yl, 370, ctxCol, 3);
+
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%d-%d / %d", topIdx + 1, min(cnt, topIdx + ROWS), cnt);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.setTextDatum(MR_DATUM);
+  tft.drawString(buf, SCR_W - 8, yl, 2);
+}
+
+void drawListButtons() {
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  bool navActive = (mode == M_GENRE && genreStationsView);
+  const char* modeLbl = mode == M_GENRE ? "GEN" : (mode == M_FAV ? "FAV" : "SD");
+
+  for (int k = 0; k < 8; k++) {
+    int x = k * BTN_W;
+    uint16_t bg = TFT_DARKCYAN;
+    if ((k == 1 || k == 3) && !navActive) bg = TFT_NAVY;
+    tft.fillRoundRect(x + 2, BTN_Y, BTN_W - 4, BTN_H, 8, bg);
+    tft.setTextColor(TFT_WHITE, bg);
+
+    String l;
+    int font = 4;
+    switch (k) {
+      case 0: l = modeLbl; break;
+      case 1: l = "<"; break;
+      case 2:
+        if (mode == M_FAV) l = String(favCount);
+        else if (mode == M_REC) l = "MAJ";
+        else if (genreStationsView) { l = "Genres"; font = 2; }
+        break;
+      case 3: l = ">"; break;
+      case 4: l = "Up"; break;
+      case 5: l = "Dn"; break;
+      case 6: l = "V-"; break;
+      case 7: l = "V+"; break;
+    }
+    tft.drawString(l, x + BTN_W / 2, BTN_Y + BTN_H / 2, font);
+  }
+}
+
+void redrawList() {
+  tft.fillScreen(TFT_BLACK);
+  drawListHeader();
+  drawList();
+  drawListButtons();
+}
+
+// ---------------- Affichage : page lecteur (radio) ----------------
+void drawPlayerHeader() {
+  tft.fillRect(0, 0, SCR_W, HEADER_H, TFT_NAVY);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString("TuneIn", 10, HEADER_H / 2, 4);
+
+  const char* recMsg = (recError == 1) ? "REC: carte SD absente"
+                     : (recError == 2) ? "REC: flux perdu"
+                     : (recError == 3) ? "REC: erreur ecriture SD"
+                     : (recError == 4) ? "REC: morceau enregistre" : nullptr;
+  tft.setTextDatum(MC_DATUM);
+  if (recMsg) {
+    tft.setTextColor(recError == 4 ? TFT_GREEN : TFT_ORANGE, TFT_NAVY);
+    tft.drawString(recMsg, SCR_W / 2 + 10, HEADER_H / 2, 2);
+  } else if (wifiOk) {
+    tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
+    tft.drawString("2 doigts : retour", SCR_W / 2 + 10, HEADER_H / 2, 2);
+  } else {
+    tft.setTextColor(TFT_ORANGE, TFT_NAVY);
+    tft.drawString("WiFi perdu...", SCR_W / 2 + 10, HEADER_H / 2, 2);
+  }
+
+  if (recWanted || recActive) tft.fillCircle(132, HEADER_H / 2, 6, TFT_RED);   // témoin REC
+
+  char v[16];
+  snprintf(v, sizeof(v), "Vol %d", volume);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setTextDatum(MR_DATUM);
+  tft.drawString(v, SCR_W - 10, HEADER_H / 2, 4);
+}
+
+// Efface la zone et écrit l'étiquette ; le contenu est dessiné par le Scroller
+void drawField(const char* label, int top, int labelX, int x0, int x1) {
+  tft.fillRect(x0, top, x1 - x0, 76, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(label, labelX, top + 10, 2);
+}
+
+void drawStationField() {
+  drawField("STATION", 36, STATION_TEXT_X, LOGO_X + LOGO_S + 2, SCR_W);
+  scrollSet(scStation, curStation);
+}
+void drawArtistField() { drawField("ARTISTE", 120, 14, 0, SCR_W); scrollSet(scArtist, curArtist); }
+void drawTitleField()  { drawField("MORCEAU", 198, 14, 0, SCR_W); scrollSet(scTitle,  curTitle);  }
+
+void drawRecButton() {
+  bool on = recWanted || recActive;
+  uint16_t bg = on ? TFT_RED : TFT_DARKCYAN;
+  int cy = PB_Y + PB_H / 2;
+  tft.fillRoundRect(PB_RC_X, PB_Y, PB_W, PB_H, 8, bg);
+  tft.setTextSize(1);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, bg);
+  if (!on) {
+    tft.fillCircle(PB_RC_X + 20, cy, 9, TFT_RED);
+    tft.drawString("REC", PB_RC_X + 58, cy, 4);
+  } else {
+    tft.fillRect(PB_RC_X + 6, cy - 5, 10, 10, TFT_WHITE);           // symbole stop
+    uint32_t s = recActive ? (millis() - recStartMs) / 1000 : 0;
+    char b[12];
+    if (s >= 3600) snprintf(b, sizeof(b), "%uh%02u", (unsigned)(s / 3600), (unsigned)((s / 60) % 60));
+    else           snprintf(b, sizeof(b), "%02u:%02u", (unsigned)(s / 60), (unsigned)(s % 60));
+    tft.drawString(b, PB_RC_X + 56, cy, 4);
+  }
+}
+
+// Bouton AUTO : arrêt de l'enregistrement à la fin du morceau
+void drawAutoButton() {
+  uint16_t bg = recAuto ? TFT_DARKGREEN : TFT_DARKCYAN;
+  tft.fillRoundRect(PB_AU_X, PB_Y, PB_W, PB_H, 8, bg);
+  tft.setTextSize(1);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(recAuto ? TFT_WHITE : TFT_LIGHTGREY, bg);
+  tft.drawString("AUTO", PB_AU_X + PB_W / 2, PB_Y + PB_H / 2, 4);
+}
+
+void drawPlayerButtons() {
+  tft.setTextSize(1);
+  tft.setTextDatum(MC_DATUM);
+  tft.fillRoundRect(PB_VM_X, PB_Y, PB_W, PB_H, 8, TFT_DARKCYAN);
+  tft.fillRoundRect(PB_ST_X, PB_Y, PB_W, PB_H, 8, TFT_DARKCYAN);
+  tft.fillRoundRect(PB_VP_X, PB_Y, PB_W, PB_H, 8, TFT_DARKCYAN);
+  tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+  tft.drawString("V-", PB_VM_X + PB_W / 2, PB_Y + PB_H / 2, 4);
+  tft.drawString("V+", PB_VP_X + PB_W / 2, PB_Y + PB_H / 2, 4);
+
+  bool fav = isFav(curEntry);
+  drawStar(PB_ST_X + PB_W / 2, PB_Y + PB_H / 2 + 1, 16,
+           fav ? TFT_YELLOW : TFT_WHITE, fav);
+  drawRecButton();
+  drawAutoButton();
+}
+
+void redrawPlayer() {
+  tft.fillScreen(TFT_BLACK);
+  drawPlayerHeader();
+  clearLogoBox();
+  drawStationField();
+  drawArtistField();
+  drawTitleField();
+  drawPlayerButtons();
+}
+
+// ---------------- Affichage : page lecteur de fichiers (SD) ----------------
+void drawFileHeader() {
+  tft.fillRect(0, 0, SCR_W, HEADER_H, TFT_NAVY);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString("Lecteur SD", 10, HEADER_H / 2, 4);
+
+  tft.setTextDatum(MC_DATUM);
+  if (fileMsg[0]) {
+    tft.setTextColor(TFT_ORANGE, TFT_NAVY);
+    tft.drawString(fileMsg, SCR_W / 2 + 30, HEADER_H / 2, 2);
+  } else {
+    tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
+    tft.drawString("2 doigts : retour", SCR_W / 2 + 30, HEADER_H / 2, 2);
+  }
+
+  char v[16];
+  snprintf(v, sizeof(v), "Vol %d", volume);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setTextDatum(MR_DATUM);
+  tft.drawString(v, SCR_W - 10, HEADER_H / 2, 4);
+}
+
+void drawFileFields() {
+  drawField("ARTISTE", 40, 14, 0, SCR_W);
+  scrollSet(scFArtist, fArtist);
+  drawField("MORCEAU", 114, 14, 0, SCR_W);
+  scrollSet(scFTitle, fTitle);
+}
+
+void drawFileButtons() {
+  tft.setTextSize(1);
+  tft.setTextDatum(MC_DATUM);
+  const int xs[5] = { PB_VM_X, PB_ST_X, PB_RC_X, PB_AU_X, PB_VP_X };
+  for (int i = 0; i < 5; i++) tft.fillRoundRect(xs[i], PB_Y, PB_W, PB_H, 8, TFT_DARKCYAN);
+  tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+  tft.drawString("V-", PB_VM_X + PB_W / 2, PB_Y + PB_H / 2, 4);
+  tft.drawString("V+", PB_VP_X + PB_W / 2, PB_Y + PB_H / 2, 4);
+
+  int cy = PB_Y + PB_H / 2;
+  int cx;
+
+  cx = PB_ST_X + PB_W / 2;                                     // précédent
+  tft.fillRect(cx - 10, cy - 9, 3, 18, TFT_WHITE);
+  tft.fillTriangle(cx + 10, cy - 9, cx + 10, cy + 9, cx - 6, cy, TFT_WHITE);
+
+  cx = PB_AU_X + PB_W / 2;                                     // suivant
+  tft.fillTriangle(cx - 10, cy - 9, cx - 10, cy + 9, cx + 6, cy, TFT_WHITE);
+  tft.fillRect(cx + 7, cy - 9, 3, 18, TFT_WHITE);
+
+  cx = PB_RC_X + PB_W / 2;                                     // lecture / pause
+  if (filePaused || fileEnded) {
+    tft.fillTriangle(cx - 7, cy - 10, cx - 7, cy + 10, cx + 10, cy, TFT_WHITE);
+  } else {
+    tft.fillRect(cx - 8, cy - 9, 5, 18, TFT_WHITE);
+    tft.fillRect(cx + 3, cy - 9, 5, 18, TFT_WHITE);
+  }
+}
+
+void drawFileProgress() {
+  uint32_t cur = (fileResult == 1) ? audio.getAudioCurrentTime() : 0;
+  uint32_t dur = (fileResult == 1) ? audio.getAudioFileDuration() : 0;
+  if (fileEnded && dur) cur = dur;
+  if (!fpForce && cur == fpLastCur && dur == fpLastDur) return;
+  fpForce = false;
+  fpLastCur = cur;
+  fpLastDur = dur;
+
+  float fr = dur ? min(1.0f, (float)cur / (float)dur) : 0.0f;
+
+  // Barre de progression
+  tft.fillRect(FP_BAR_X - 2, FP_BAR_Y - 2, FP_BAR_W + 4, FP_BAR_H + 4, TFT_BLACK);
+  tft.drawRoundRect(FP_BAR_X, FP_BAR_Y, FP_BAR_W, FP_BAR_H, 5, TFT_DARKGREY);
+  int fw = (int)((FP_BAR_W - 4) * fr);
+  if (fw > 3) tft.fillRoundRect(FP_BAR_X + 2, FP_BAR_Y + 2, fw, FP_BAR_H - 4, 3, TFT_CYAN);
+
+  // Temps écoulé / durée / position dans la liste
+  tft.fillRect(0, 230, SCR_W, 22, TFT_BLACK);
+  char t1[16], t2[16], info[48], sz[16];
+  fmtTime(t1, sizeof(t1), cur);
+  if (dur) fmtTime(t2, sizeof(t2), dur); else strlcpy(t2, "--:--", sizeof(t2));
+  fmtSize(sz, sizeof(sz), (fileIdx >= 0 && fileIdx < recCount) ? recList[fileIdx].size : 0);
+  snprintf(info, sizeof(info), "%d / %d  -  %s", fileIdx + 1, recCount, sz);
+
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(t1, FP_BAR_X, 240, 2);
+  tft.setTextDatum(MR_DATUM);
+  tft.drawString(t2, FP_BAR_X + FP_BAR_W, 240, 2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(info, SCR_W / 2, 240, 2);
+}
+
+void fileShow() {                           // redessine les éléments variables du lecteur
+  if (page != PAGE_FILE) return;
+  drawFileHeader();
+  drawFileFields();
+  drawFileButtons();
+  fpForce = true;
+  drawFileProgress();
+}
+
+void redrawFile() {
+  tft.fillScreen(TFT_BLACK);
+  fileShow();
+}
+
+// Ouvre un fichier : la radio est coupée, la lecture démarre dans la tâche audio
+void fileOpen(int idx) {
+  if (idx < 0 || idx >= recCount) return;
+  fileIdx = idx;
+
+  // plus de radio
+  streamActive = false;
+  newStream = false;
+  resolveReq = false;
+  apiStation[0] = 0;
+  curEntry[0] = 0;
+  curStation = ""; curArtist = ""; curTitle = "";
+  songDirty = false;
+
+  fileNameParts(recList[idx].name, fArtist, fTitle);
+  snprintf(playFilePath, sizeof(playFilePath), "/rec/%s", recList[idx].name);
+
+  fileOpened = true;
+  filePaused = false;
+  fileEnded = false;
+  fileFailShown = false;
+  fileMsg[0] = 0;
+  fileResult = 0;
+  fileRunMs = millis();
+  fpForce = true;
+  playFileReq = true;                       // en dernier : la tâche audio lit les variables ci-dessus
+}
+
+void goFile(int idx) {
+  if (idx < 0 || idx >= recCount) return;
+  if (recWanted || recActive) {             // lecture SD et enregistrement ne se mélangent pas
+    toast("Lecture impossible pendant un REC");
+    drawList();
+    return;
+  }
+  fileOpen(idx);
+  page = PAGE_FILE;
+  redrawFile();
+}
+
+void leaveFile() {
+  stopStream = true;                        // la tâche audio arrête la lecture
+  fileOpened = false;
+  filePaused = false;
+  page = PAGE_LIST;
+  redrawList();
+}
+
+// Appelé à chaque tour de loop sur la page lecteur de fichiers
+void fileLoop() {
+  uint32_t now = millis();
+
+  if (fileOpened) {
+    if (fileResult == -1 && !fileFailShown) {
+      fileFailShown = true;
+      strlcpy(fileMsg, "Fichier illisible", sizeof(fileMsg));
+      drawFileHeader();
+    } else if (fileResult == 1 && !filePaused && !fileEnded) {
+      if (audio.isRunning()) fileRunMs = now;
+      else if (now - fileRunMs > 2500) {                 // fin du fichier
+        if (fileIdx + 1 < recCount) { fileOpen(fileIdx + 1); fileShow(); }
+        else {
+          fileEnded = true;
+          strlcpy(fileMsg, "Termine", sizeof(fileMsg));
+          drawFileHeader();
+          drawFileButtons();
+        }
+      }
+    }
+  }
+
+  scrollTick(scFArtist);
+  scrollTick(scFTitle);
+
+  static uint32_t lastProg = 0;
+  if (now - lastProg >= 500) { lastProg = now; drawFileProgress(); }
+}
+
+// ---------------- Navigation ----------------
+// entry = "guide_id|Nom de la station"
+void goPlayer(const String& entry) {
+  char id[24];
+  entryId(entry.c_str(), id, sizeof(id));
+  if ((recWanted || recActive) && strcmp(id, recStation) != 0) recWanted = false;   // pas de REC sur une autre station
+
+  strlcpy(curEntry, entry.c_str(), sizeof(curEntry));
+  curStation = String(entryName(entry.c_str()));
+  curArtist  = "";
+  curTitle   = "Chargement...";
+  strlcpy(apiStation, id, sizeof(apiStation));
+  songTitle[0] = 0;                       // pas de titre périmé de la station précédente
+  songArtist[0] = 0;
+  songDirty  = false;
+  songSeq    = 0;                         // le suivi de morceau repart de zéro
+  logoReset  = true;
+  newStream  = false;
+  resolveFail = false;
+  resolveReq = true;                      // la tâche réseau résout l'URL puis lance le flux
+  streamActive = true;
+  lastAudioOk = millis();
+  page = PAGE_PLAYER;
+  redrawPlayer();
+}
+
+void goList() {
+  page = PAGE_LIST;
+  redrawList();
+}
+
+// Horloge -> radio (même orientation paysage, on passe simplement à la liste)
+void enterRadio() {
+  if (spr.created()) spr.deleteSprite();      // libère 25 Ko de RAM
+  favPress = false;
+  confirmAct = 0;
+  setMode(mode);                              // charge les genres / la liste SD si besoin
+  page = PAGE_LIST;
+  redrawList();
+}
+
+// Radio -> horloge : coupe le flux (et l'enregistrement)
+void enterClock() {
+  recWanted = false;                          // l'enregistrement s'arrête avec le flux
+  streamActive = false;                       // plus de reprise automatique
+  newStream = false;
+  resolveReq = false;
+  stopStream = true;                          // la tâche audio coupe le flux
+  fileOpened = false;
+  apiStation[0] = 0;                          // arrête les requêtes logo / résolution
+  curEntry[0] = 0;
+  pendingUrl[0] = 0;
+  curStation = ""; curArtist = ""; curTitle = "";
+  songDirty = false;
+  favPress = false;
+  confirmAct = 0;
+
+  page = PAGE_CLOCK;
+  tft.fillScreen(TFT_BLACK);
+  if (!spr.created()) {
+    spr.setColorDepth(16);
+    if (!spr.createSprite(FACE, BAND_H)) Serial.println("Erreur : creation du sprite impossible");
+  }
+  lastFrame = 0;
+}
+
+// ---------------- Boîte de confirmation (favoris / enregistrements) ----------------
+void drawConfirm() {
+  tft.fillRoundRect(40, 70, 400, 180, 10, TFT_BLACK);
+  tft.drawRoundRect(40, 70, 400, 180, 10, TFT_WHITE);
+  tft.setTextSize(1);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  if (confirmAct == 1) {
+    tft.drawString("Supprimer ce favori ?", 240, 100, 4);
+    drawTextFit(String(entryName(favs[confirmIdx])), 60, 140, 360, TFT_CYAN, 1);
+  } else if (confirmAct == 3) {
+    tft.drawString("Supprimer ce fichier ?", 240, 100, 4);
+    char base[100];
+    strlcpy(base, recList[confirmIdx].name, sizeof(base));
+    char* dot = strrchr(base, '.');
+    if (dot) *dot = 0;
+    drawTextFit(String(base), 60, 140, 360, TFT_CYAN, 1);
+  } else {
+    tft.drawString("Vider tous les favoris ?", 240, 105, 4);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString(String(favCount) + " favoris", 240, 145, 2);
+  }
+
+  tft.fillRoundRect(90, 190, 140, 50, 8, TFT_RED);
+  tft.fillRoundRect(250, 190, 140, 50, 8, TFT_DARKCYAN);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.drawString("Oui", 160, 215, 4);
+  tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+  tft.drawString("Non", 320, 215, 4);
+}
+
+// ---------------- Gestion du toucher ----------------
+void handleTouch() {
+  static uint32_t last = 0;
+  static bool waitRelease = false;
+
+  uint16_t x = 0, y = 0;
+  int n = readTouch(x, y);
+
+  // --- Horloge : 1 doigt -> radio ---
+  if (page == PAGE_CLOCK) {
+    if (n == 0) { waitRelease = false; return; }
+    if (!waitRelease) {
+      waitRelease = true;
+      enterRadio();
+    }
+    return;
+  }
+
+  // --- Boîte de confirmation ---
+  if (confirmAct) {
+    if (n == 0) { waitRelease = false; return; }
+    if (waitRelease || n != 1) return;
+    if (y >= 190 && y < 240) {
+      if (x >= 90 && x < 230) {                       // Oui
+        if (confirmAct == 1) favRemoveAt(confirmIdx);
+        else if (confirmAct == 2) favClear();
+        else if (confirmAct == 3) recDelete(confirmIdx);
+        confirmAct = 0; waitRelease = true; topIdx = 0;
+        redrawList();
+      } else if (x >= 250 && x < 390) {               // Non
+        confirmAct = 0; waitRelease = true;
+        redrawList();
+      }
+    }
+    return;
+  }
+
+  // --- Modes FAV / SD : tap court = lecture, appui long = suppression ---
+  if (page == PAGE_LIST && (mode == M_FAV || mode == M_REC) && !listLoading) {
+    int cnt = listCount();
+    if (n >= 2) favPress = false;
+    if (n == 0 && favPress) {                         // relâché avant 0,7 s
+      favPress = false;
+      waitRelease = false;
+      if (favIdx >= 0 && favIdx < cnt) {
+        if (mode == M_FAV) goPlayer(String(favs[favIdx]));
+        else               goFile(favIdx);
+      }
+      return;
+    }
+    if (n == 1 && !waitRelease) {
+      if (favPress) {
+        if (millis() - favT0 >= 700) {                // appui long détecté
+          favPress = false;
+          waitRelease = true;
+          if (mode == M_FAV) confirmAct = (favIdx >= 0) ? 1 : 2;
+          else               confirmAct = 3;
+          confirmIdx = favIdx;
+          drawConfirm();
+        }
+        return;
+      }
+      if (y >= LIST_Y && y < LIST_Y + ROWS * ROW_H) {
+        int idx = topIdx + (y - LIST_Y) / ROW_H;
+        if (idx < cnt) { favPress = true; favT0 = millis(); favIdx = idx; return; }
+      } else if (mode == M_FAV && y >= BTN_Y && x / BTN_W == 2 && favCount > 0) {
+        favPress = true; favT0 = millis(); favIdx = -2; return;
+      }
+    }
+  }
+
+  if (n == 0) { waitRelease = false; return; }
+  if (waitRelease) return;
+
+  // --- Page lecteur (radio) ---
+  if (page == PAGE_PLAYER) {
+    if (n >= 2) {                         // 2 doigts : retour à la liste
+      waitRelease = true;
+      goList();
+      return;
+    }
+    if (millis() - last < 250) return;
+    last = millis();
+    if (y >= PB_Y) {
+      if (x >= PB_VM_X && x < PB_VM_X + PB_W) {
+        volume = max(0, volume - 1);  volDirty = true; drawPlayerHeader();
+      } else if (x >= PB_VP_X && x < PB_VP_X + PB_W) {
+        volume = min(21, volume + 1); volDirty = true; drawPlayerHeader();
+      } else if (x >= PB_ST_X && x < PB_ST_X + PB_W) {
+        favToggle(curEntry);
+        drawPlayerButtons();
+      } else if (x >= PB_RC_X && x < PB_RC_X + PB_W) {
+        recToggle();
+        drawPlayerHeader();
+        drawRecButton();
+      } else if (x >= PB_AU_X && x < PB_AU_X + PB_W) {
+        if (!(recWanted || recActive)) {              // l'option se règle avant le REC
+          recAuto = !recAuto;
+          recAutoSave();
+          drawAutoButton();
+        }
+      }
+    }
+    return;
+  }
+
+  // --- Page lecteur de fichiers ---
+  if (page == PAGE_FILE) {
+    if (n >= 2) {                         // 2 doigts : retour à la liste (lecture arrêtée)
+      waitRelease = true;
+      leaveFile();
+      return;
+    }
+    if (millis() - last < 250) return;
+    last = millis();
+
+    if (y >= PB_Y) {
+      if (x >= PB_VM_X && x < PB_VM_X + PB_W) {
+        volume = max(0, volume - 1);  volDirty = true; drawFileHeader();
+      } else if (x >= PB_VP_X && x < PB_VP_X + PB_W) {
+        volume = min(21, volume + 1); volDirty = true; drawFileHeader();
+      } else if (x >= PB_ST_X && x < PB_ST_X + PB_W) {          // précédent
+        if (fileIdx > 0) { fileOpen(fileIdx - 1); fileShow(); }
+      } else if (x >= PB_RC_X && x < PB_RC_X + PB_W) {          // lecture / pause
+        if (fileEnded) { fileOpen(fileIdx); fileShow(); }
+        else if (fileResult == 1) {
+          pauseReq = true;
+          filePaused = !filePaused;
+          drawFileButtons();
+        }
+      } else if (x >= PB_AU_X && x < PB_AU_X + PB_W) {          // suivant
+        if (fileIdx + 1 < recCount) { fileOpen(fileIdx + 1); fileShow(); }
+      }
+    }
+#if USE_SEEK
+    else if (fileResult == 1 && !fileEnded &&
+             y >= FP_BAR_Y - 14 && y <= FP_BAR_Y + FP_BAR_H + 14 &&
+             x >= FP_BAR_X - 6 && x <= FP_BAR_X + FP_BAR_W + 6) {      // clic sur la barre : déplacement
+      float fr = (float)((int)x - FP_BAR_X) / (float)FP_BAR_W;
+      if (fr < 0) fr = 0;
+      if (fr > 0.98f) fr = 0.98f;
+      if (fileIdx >= 0 && fileIdx < recCount) {
+        seekReq = (uint32_t)(fr * (float)recList[fileIdx].size);
+        fileRunMs = millis();
+        fpForce = true;
+      }
+    }
+#endif
+    return;
+  }
+
+  // --- Page liste ---
+  if (n >= 2) {                           // 2 doigts : retour à l'horloge (flux coupé)
+    waitRelease = true;
+    enterClock();
+    return;
+  }
+  if (n != 1) return;
+  if (millis() - last < 250) return;
+  last = millis();
+
+  if (y >= BTN_Y) {
+    int k = x / BTN_W;
+    if (k > 7) k = 7;
+
+    if (listLoading && k < 6) return;
+
+    switch (k) {
+      case 0: {   // mode : GEN -> FAV -> SD
+        Mode next = (mode == M_GENRE) ? M_FAV
+                  : (mode == M_FAV)   ? M_REC : M_GENRE;
+        setMode(next);
+        break;
+      }
+      case 1:   // genre précédent
+        if (mode == M_GENRE && genreStationsView && genreCount > 0)
+          requestGenreStations((genreCur + genreCount - 1) % genreCount);
+        break;
+      case 2:   // centre : retour aux genres / actualisation de la liste SD
+        if (mode == M_GENRE && genreStationsView) { genreStationsView = false; topIdx = 0; listFail = false; }
+        else if (mode == M_REC) { recScan(); topIdx = 0; }
+        break;
+      case 3:   // genre suivant
+        if (mode == M_GENRE && genreStationsView && genreCount > 0)
+          requestGenreStations((genreCur + 1) % genreCount);
+        break;
+      case 4: topIdx = max(0, topIdx - ROWS); break;
+      case 5: if (topIdx + ROWS < listCount()) topIdx += ROWS; break;
+      case 6: volume = max(0, volume - 1);  volDirty = true; break;
+      case 7: volume = min(21, volume + 1); volDirty = true; break;
+    }
+    drawListHeader(); drawList(); drawListButtons();
+
+  } else if (y >= LIST_Y && y < LIST_Y + ROWS * ROW_H) {
+    if (mode == M_FAV || mode == M_REC) return;   // gérés plus haut (tap / appui long)
+    if (listLoading || listFail) return;
+    int idx = topIdx + (y - LIST_Y) / ROW_H;
+    if (idx >= listCount()) return;
+    waitRelease = true;
+    if (genreListView()) {
+      requestGenreStations(idx);
+      drawList(); drawListButtons();
+    } else {
+      goPlayer(String(listName(idx)));
+    }
+  }
+}
+
+// ---------------- Surveillance WiFi + flux ----------------
+void wifiWatch() {
+  static uint32_t lastCheck = 0, lastTry = 0;
+  uint32_t now = millis();
+  if (now - lastCheck < 1000) return;
+  lastCheck = now;
+
+  bool ok = (WiFi.status() == WL_CONNECTED);
+  if (ok != wifiOk) {
+    wifiOk = ok;
+    Serial.println(ok ? "WiFi retabli" : "WiFi perdu");
+    if (page == PAGE_PLAYER) drawPlayerHeader(); else updateHeaderText();
+    if (ok && streamActive) {              // reprise automatique : l'URL est résolue à nouveau
+      resolveReq = true;
+      lastAudioOk = now;
+    }
+  }
+
+  if (!ok) {
+    if (now - lastTry > 8000) {
+      lastTry = now;
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+    return;
+  }
+
+  // Flux interrompu alors que le WiFi est là : on relance
+  if (streamActive) {
+    if (audio.isRunning()) lastAudioOk = now;
+    else if (!newStream && !resolveReq && now - lastAudioOk > 20000) {
+      Serial.println("Flux coupe : reconnexion");
+      resolveReq = true;
+      lastAudioOk = now;
+    }
+  }
+}
+
+// ---------------- Setup / loop ----------------
+void setup() {
+  Serial.begin(115200);
+  Serial.printf("PSRAM libre : %u octets\n", (unsigned)ESP.getFreePsram());
+
+  imgMux = xSemaphoreCreateMutex();
+  favsLoad();
+  recAutoLoad();
+
+  tft.init();
+  u8f.begin(tft);
+  u8f.setFontMode(1);
+  tft.setRotation(1);                     // paysage (écran et radio)
+  tft.fillScreen(TFT_BLACK);
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(true);
+  TJpgDec.setCallback(tft_output);
+  touchInit();
+  sdInit();
+  initColors();
+  initSegments();
+
+  // Zones de texte défilant
+  scrollInit(scStation, STATION_TEXT_X, 62,  SCR_W - 8 - STATION_TEXT_X, 40, TFT_CYAN,   TFT_BLACK, 0, 1);
+  scrollInit(scArtist,  14,             146, SCR_W - 28,                 40, TFT_YELLOW, TFT_BLACK, 0, 1);
+  scrollInit(scTitle,   14,             224, SCR_W - 28,                 40, TFT_WHITE,  TFT_BLACK, 0, 1);
+  scrollInit(hdrSc,     8,              0,   SCR_W - 60,                 HEADER_H, TFT_WHITE, TFT_NAVY, 2, 2);
+  scrollInit(scFArtist, 14,             66,  SCR_W - 28,                 40, TFT_YELLOW, TFT_BLACK, 0, 1);
+  scrollInit(scFTitle,  14,             140, SCR_W - 28,                 40, TFT_WHITE,  TFT_BLACK, 0, 1);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Connexion WiFi...", SCR_W / 2, SCR_H / 2, 4);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) delay(300);
+
+  // --- Heure (NTP), puis resynchronisation automatique en arrière-plan ---
+  tft.fillScreen(TFT_BLACK);
+  tft.drawString("Synchronisation de l'heure...", SCR_W / 2, SCR_H / 2, 4);
+  configTzTime(TZ_INFO, "pool.ntp.org", "time.google.com", "fr.pool.ntp.org");
+  struct tm tinfo;
+  if (!getLocalTime(&tinfo, 10000)) {
+    Serial.println("NTP indisponible : heure de compilation");
+    setFallbackTime();
+  }
+
+  tft.fillScreen(TFT_BLACK);
+  tft.drawString("Initialisation...", SCR_W / 2, SCR_H / 2, 4);
+  if (!allocBuffers()) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("Erreur memoire (PSRAM)", SCR_W / 2, SCR_H / 2, 4);
+    while (true) delay(1000);
+  }
+
+  Audio::audio_info_callback = my_audio_info;     // titres du flux (ESP32-audioI2S >= 3.4.2)
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.setVolume(volume);
+  xTaskCreatePinnedToCore(audioTask, "audio", 8192,  nullptr, 3, nullptr, 1);
+  xTaskCreatePinnedToCore(apiTask,   "api",   24576, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(recTask,   "rec",   12288, nullptr, 2, nullptr, 0);
+
+  enterClock();                           // démarrage sur l'horloge
+}
+
+void loop() {
+  handleTouch();
+  wifiWatch();
+
+  // Fin d'un chargement de liste (genres / stations d'un genre)
+  if (listReady) {
+    listReady = false;
+    listLoading = false;
+    topIdx = 0;
+    if (page == PAGE_LIST) { drawList(); drawListButtons(); }
+  }
+  if (listLoading && millis() - loadingSince > 40000) {   // sécurité
+    listLoading = false; listFail = true;
+    if (page == PAGE_LIST) { drawList(); drawListButtons(); }
+  }
+
+  // Fin du message temporaire de la liste
+  if (toastUntil && millis() >= toastUntil) {
+    toastUntil = 0;
+    if (page == PAGE_LIST) drawList();
+  }
+
+  // Résolution du flux impossible
+  if (resolveFail) {
+    resolveFail = false;
+    streamActive = false;
+    stopStream = true;
+    curTitle = "Flux indisponible";
+    if (page == PAGE_PLAYER) drawTitleField(); else updateHeaderText();
+  }
+
+  // Nouvel artiste / titre (envoyé dans le flux)
+  if (songDirty) {
+    songDirty = false;
+    String a = String(songArtist);
+    String t = String(songTitle);
+    if (a != curArtist || t != curTitle) {
+      bool aCh = (a != curArtist), tCh = (t != curTitle);
+      curArtist = a;
+      curTitle  = t;
+      if (page == PAGE_PLAYER) {
+        if (aCh) drawArtistField();
+        if (tCh) drawTitleField();
+      } else updateHeaderText();
+    }
+  }
+
+  // Station sans titre dans le flux : on retire "Chargement..." après quelques secondes
+  static uint32_t runSince = 0;
+  if (page == PAGE_PLAYER && streamActive && curTitle == "Chargement..." && audio.isRunning()) {
+    if (!runSince) runSince = millis();
+    else if (millis() - runSince > 5000) { runSince = 0; curTitle = ""; drawTitleField(); }
+  } else runSince = 0;
+
+  // Nouveau logo de station
+  if (logoSlot.ready) {
+    xSemaphoreTake(imgMux, portMAX_DELAY);
+    uint8_t* b = logoSlot.buf; size_t l = logoSlot.len;
+    logoSlot.buf = nullptr; logoSlot.len = 0; logoSlot.ready = false;
+    xSemaphoreGive(imgMux);
+    if (page == PAGE_PLAYER) drawLogo(b, l);
+    if (b) free(b);
+  }
+
+  // Message "morceau enregistré" : disparaît après 6 s
+  if (recError == 4 && millis() - recDoneMs > 6000) {
+    recError = 0;
+    recStateDirty = true;
+  }
+
+  // Mise à jour de l'interface d'enregistrement
+  static bool lastUiRec = false;
+  static uint32_t lastRecTick = 0;
+  bool uiRec = recWanted || recActive;
+  if (uiRec != lastUiRec || recStateDirty) {
+    recStateDirty = false;
+    lastUiRec = uiRec;
+    if (page == PAGE_PLAYER)    { drawPlayerHeader(); drawRecButton(); }
+    else if (page == PAGE_LIST) { drawListHeader(); }
+  }
+  if (page == PAGE_PLAYER && recActive && millis() - lastRecTick >= 1000) {
+    lastRecTick = millis();
+    drawRecButton();                      // temps écoulé
+  }
+
+  // Animation : textes défilants (radio), lecteur de fichiers ou horloge
+  if (page == PAGE_PLAYER)      { scrollTick(scStation); scrollTick(scArtist); scrollTick(scTitle); }
+  else if (page == PAGE_LIST)   { scrollTick(hdrSc); }
+  else if (page == PAGE_FILE)   { fileLoop(); }
+  else                          { clockLoop(); }
+
+  delay(10);
+}
